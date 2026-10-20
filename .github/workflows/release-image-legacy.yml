@@ -1,0 +1,76 @@
+name: release-happy-image-legacy
+# Produces a classic docker-archive (uncompressed layer.tar + outer gzip).
+# Why: docker save from a containerd image store mislabels recompressed layers,
+# causing "wrong diff id calculated on extraction" on the board's containerd.
+# skopeo writes the legacy layout directly from the registry blobs.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Image tag to package (default cli-1.2.5)'
+        required: true
+        default: cli-1.2.5
+permissions:
+  contents: write
+env:
+  IMAGE: ghcr.io/mobius-w/happy-arm64
+jobs:
+  package:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install skopeo
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo
+          skopeo --version
+      - name: Copy image to legacy docker-archive
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          skopeo copy --override-arch arm64 --override-os linux \
+            "docker://$IMAGE:$REF" \
+            "docker-archive:out/happy-image-$REF.tar:$IMAGE:$REF"
+          ls -lh out/
+          tar -tf "out/happy-image-$REF.tar" | head -20
+      - name: Self-test archive on this runner
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          docker load -i "out/happy-image-$REF.tar"
+          docker run --rm --network none --entrypoint node "$IMAGE:$REF" -v
+      - name: Compress and checksum
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          cd out
+          gzip -1 "happy-image-$REF.tar"
+          ls -lh
+          sha256sum "happy-image-$REF.tar.gz" | tee SHA256SUMS.txt
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          TAG="image-legacy-$REF"
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" "out/happy-image-$REF.tar.gz" out/SHA256SUMS.txt \
+            --repo "${{ github.repository }}" \
+            --title "Happy arm64 image $REF (legacy archive)" \
+            --notes-file out/SHA256SUMS.txt
+      - name: Summary
+        run: |
+          {
+            echo "### legacy archive packaged"
+            echo ""
+            echo "- image: \`$IMAGE:${{ inputs.ref }}\`"
+            echo "- release tag: \`image-legacy-${{ inputs.ref }}\`"
+            echo "- asset: \`happy-image-${{ inputs.ref }}.tar.gz\` (classic layout, uncompressed layers)"
+          } >> "$GITHUB_STEP_SUMMARY"
