@@ -1,0 +1,61 @@
+name: diagnose-happy-layer
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  IMAGE: ghcr.io/mobius-w/happy-arm64
+  REF: cli-1.2.5
+  EXPECTED_BIG_DIFFID: sha256:9792aaa5eb3730ffffdc93e37d5f567e62324bd5bb5dd8d421d0690b2d23a01c
+  BIG_BLOB_SIZE: "1373472745"
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - name: Install skopeo
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo
+      - name: Copy registry blobs to a dir
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          skopeo copy --override-arch arm64 --override-os linux \
+            "docker://$IMAGE:$REF" "dir:out"
+          ls -l out
+      - name: Decompress and hash the large layer
+        run: |
+          set -euo pipefail
+          BLOB=$(find out -type f -size "${BIG_BLOB_SIZE}c" | head -1)
+          echo "blob=$BLOB"
+          sha256sum "$BLOB"
+          head -c 8 "$BLOB" | od -An -tx1
+          gzip -dc "$BLOB" > /tmp/big-layer.tar
+          ls -l /tmp/big-layer.tar
+          got=$(sha256sum /tmp/big-layer.tar | cut -d' ' -f1)
+          echo "expected=$EXPECTED_BIG_DIFFID"
+          echo "got=sha256:$got"
+          if [ "sha256:$got" = "$EXPECTED_BIG_DIFFID" ]; then
+            echo "RESULT=registry_blob_matches_config"
+          else
+            echo "RESULT=registry_blob_does_not_match_config"
+          fi
+          tar -tf /tmp/big-layer.tar > /tmp/big-layer.list || true
+          wc -l /tmp/big-layer.list
+          tail -3 /tmp/big-layer.list
+      - name: Compare with skopeo docker-archive output
+        run: |
+          set -euo pipefail
+          skopeo copy --override-arch arm64 --override-os linux \
+            "docker://$IMAGE:$REF" "docker-archive:/tmp/legacy.tar:$IMAGE:$REF"
+          mkdir -p /tmp/legacy
+          tar -xf /tmp/legacy.tar -C /tmp/legacy
+          for f in /tmp/legacy/*/layer.tar; do
+            sz=$(stat -c%s "$f")
+            if [ "$sz" -gt 3000000000 ]; then
+              echo "archive-layer=$f size=$sz"
+              sha256sum "$f"
+            fi
+          done
