@@ -39,6 +39,7 @@ jobs:
           REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
+          mkdir -p out
           python3 - "$IMAGE" "$REF" <<'PY'
           import hashlib, json, os, shutil, subprocess, sys
 
