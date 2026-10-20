@@ -6,6 +6,8 @@ Cloud-built `linux/arm64` standalone image of [slopus/happy](https://github.com/
 - Dockerfile: repository root `Dockerfile` — standalone PGlite + local files, no Postgres/Redis/S3
 - Image: `ghcr.io/mobius-w/happy-arm64:cli-1.2.5` (also `:latest`)
 - Runner: `ubuntu-24.04-arm` native, no QEMU
+- Runtime: `-p 3005:3005`, `/data` volume, `HANDY_MASTER_SECRET` required; `/` answers
+  `Welcome to Happy Server!`, `/health` queries PGlite and returns `{"status":"ok",...}`
 
 This repo intentionally contains only the build recipe; the source is checked out from upstream inside the workflow.
 
@@ -16,36 +18,37 @@ The upstream root Dockerfile does **not** include the webapp. The server still a
 On the WF7000A network the GHCR registry client connects but never moves bytes;
 `curl` to the same CDN does work.
 
-### Adopted: `release-image-legacy.yml` (skopeo → classic archive)
+### Adopted: `release-image-direct.yml` (registry blobs → classic archive)
 
-`skopeo copy docker://… docker-archive:…` writes a **classic** docker-save tar
-with uncompressed `layer.tar` entries, then the workflow `gzip -1`s the outer
-tar, publishes it as a Release asset, and self-tests it on the runner with
-`docker load` + `node -v` before uploading.
+The workflow pulls the image with `skopeo copy docker://… dir:raw`, then builds a
+**classic** docker-save archive **by hardlinking the original registry gzip blobs**.
+It does not re-compress anything. Before tarring, every layer is checked twice:
 
-- Release: `image-legacy-cli-1.2.5`
-- Asset: `happy-image-cli-1.2.5.tar.gz` — 1,824,248,556 bytes
-- sha256: `105690cf1c41e87bc4e4b88419049379f364a77b3572d36e83b351cf9edb3cc4`
+1. `sha256(blob) == manifest layer digest` (compressed digest), and
+2. `sha256(gzip -dc blob) == config.rootfs.diff_ids[i]` (uncompressed diffID).
 
-On the board, `fetch-release-image.py` downloads the asset in parallel 64 MB
+Any mismatch fails the run. The archive is `gzip -1`'d and published as a Release asset.
+
+- Release: `image-direct-cli-1.2.5`
+- Asset: `happy-image-cli-1.2.5.tar.gz` — **1,672,853,994 bytes**
+- sha256: `a27dd31a356234b8553e00b3673eddb525fcbe1fe9afb86172b4ad77f41ba076`
+
+On the board, `fetch-release-image.py` downloads the asset in parallel 64 MiB
 ranges from the signed `release-assets.githubusercontent.com` URL, verifies the
-sha256, runs `docker load -i`, then deletes the archive.
+sha256, runs `docker load -i`, and keeps the archive for post-load inspection.
 
-### Why not `docker save` (former `release-image.yml`)
+### Why the earlier attempts failed (do not reuse)
 
-`docker save` from a containerd image store on the runner exported some layers
-as gzip while labelling them as uncompressed `tar`. The board's containerd then
-hashed the compressed bytes as a diffID:
+| Attempt | Output | Failure on board |
+|---|---|---|
+| `release-image.yml` — `docker save` from a containerd store | 1,824,233,049 B, sha256 `f5e995e4…` | layers re-compressed but labelled uncompressed → `wrong diff id calculated on extraction` |
+| `release-image-legacy.yml` — `skopeo docker-archive:` | 1,824,248,556 B, sha256 `105690cf…` | skopeo rewrote the 3.99 GB layer (content store `9792aaa5…` vs output `fbd38a…`) → same diffID error |
 
-```
-apply layer error … wrong diff id calculated on extraction
-```
-
-The image metadata loaded (`Loaded image: …`) but no container could start. The
-archive was byte-valid (sha256 matched), so this was a format/label bug, not a
-transfer corruption. The legacy skopeo archive avoids it entirely. Keep
-`release-image.yml` only as a historical record; do not use its output on the
-board.
+Both archives were byte-valid (sha256 matched their Release notes), so this was never transfer corruption.
+The root cause is that **classic overlay2 `docker load` does not verify diffIDs**, so the runner self-test
+(`docker load` + `node -v`) passed while containerd 2.3.3 on the board rejected the image. `diagnose-layer.yml`
+proved the GHCR blob itself hashes to the expected diffID, which is why the direct route preserves the original
+blobs untouched. Keep the two old workflows only as historical records.
 
 ### Alternate: `fetch-happy-image.py`
 
