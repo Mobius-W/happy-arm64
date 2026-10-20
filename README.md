@@ -6,7 +6,8 @@ Cloud-built `linux/arm64` standalone image of [slopus/happy](https://github.com/
 - Dockerfile: repository root `Dockerfile` — standalone PGlite + local files, no Postgres/Redis/S3
 - Image: `ghcr.io/mobius-w/happy-arm64:cli-1.2.5` (also `:latest`)
 - Runner: `ubuntu-24.04-arm` native, no QEMU
-- Runtime: `-p 3005:3005`, `/data` volume, `HANDY_MASTER_SECRET` required; `/` answers
+- Runtime: `-p 0.0.0.0:3005:3005` (IPv4 only; the board has a public IPv6 address), `/data` volume,
+  `HANDY_MASTER_SECRET` required; `/` answers
   `Welcome to Happy Server!`, `/health` queries PGlite and returns `{"status":"ok",...}`
 
 This repo intentionally contains only the build recipe; the source is checked out from upstream inside the workflow.
