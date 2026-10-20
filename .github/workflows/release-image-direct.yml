@@ -1,0 +1,120 @@
+name: release-happy-image-direct
+# Classic docker-archive that preserves the registry layer blobs byte-for-byte.
+# skopeo's docker-archive destination rewrote the 3.99 GB layer (diffID mismatch);
+# this workflow never decompresses/recompresses layers: it copies the original
+# gzip blobs and proves gzip -dc | sha256 == config rootfs.diff_ids before release.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Image tag to package (default cli-1.2.5)'
+        required: true
+        default: cli-1.2.5
+permissions:
+  contents: write
+env:
+  IMAGE: ghcr.io/mobius-w/happy-arm64
+jobs:
+  package:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install skopeo
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo
+      - name: Copy registry blobs without touching their bytes
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p raw
+          skopeo copy --override-arch arm64 --override-os linux \
+            "docker://$IMAGE:$REF" "dir:raw"
+          ls -l raw | head
+      - name: Assemble classic archive and verify every layer
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          python3 - "$IMAGE" "$REF" <<'PY'
+          import hashlib, json, os, shutil, subprocess, sys
+
+          image, ref = sys.argv[1], sys.argv[2]
+          raw = "raw"
+          stage = "stage"
+          shutil.rmtree(stage, ignore_errors=True)
+          os.makedirs(os.path.join(stage, "blobs"), exist_ok=True)
+
+          manifest = json.load(open(os.path.join(raw, "manifest.json")))
+          cfg_digest = manifest["config"]["digest"].split(":")[1]
+          cfg_src = os.path.join(raw, cfg_digest)
+          cfg = json.load(open(cfg_src))
+          diff_ids = cfg["rootfs"]["diff_ids"]
+          layers = manifest["layers"]
+          if len(layers) != len(diff_ids):
+              sys.exit(f"layer count {len(layers)} != diffID count {len(diff_ids)}")
+
+          cfg_name = cfg_digest + ".json"
+          shutil.copyfile(cfg_src, os.path.join(stage, cfg_name))
+
+          entries = []
+          for i, (layer, diff_id) in enumerate(zip(layers, diff_ids)):
+              digest = layer["digest"].split(":")[1]
+              src = os.path.join(raw, digest)
+              name = "blobs/%s.tar.gz" % digest
+              dst = os.path.join(stage, name)
+              os.link(src, dst)                      # hardlink: no duplicate bytes
+              # Byte-for-byte layer digest check.
+              h = hashlib.sha256()
+              with open(src, "rb") as f:
+                  for b in iter(lambda: f.read(8 << 20), b""):
+                      h.update(b)
+              if "sha256:" + h.hexdigest() != layer["digest"]:
+                  sys.exit(f"layer {i}: compressed digest mismatch")
+              # The decisive check: decompress the full (possibly multistream) gzip
+              # and compare with the diffID the image config requires.
+              p = subprocess.run(["sh", "-c", 'gzip -dc "$1" | sha256sum', "sh", src],
+                                 check=True, capture_output=True, text=True)
+              got = "sha256:" + p.stdout.split()[0]
+              print(f"layer {i}: {layer['size']} bytes -> {got}")
+              if got != diff_id:
+                  sys.exit(f"layer {i}: diffID mismatch: got {got}, want {diff_id}")
+              entries.append(name)
+
+          docker_manifest = [{
+              "Config": cfg_name,
+              "RepoTags": [f"{image}:{ref}"],
+              "Layers": entries,
+          }]
+          json.dump(docker_manifest, open(os.path.join(stage, "manifest.json"), "w"),
+                    separators=(",", ":"))
+          print("all layers verified against config diff_ids")
+          PY
+          tar -C stage -cf "out/happy-image-$REF.tar" manifest.json "$(ls stage | grep -E '^[0-9a-f]+\.json$' | head -1)" blobs
+          ls -lh "out/happy-image-$REF.tar"
+          tar -tf "out/happy-image-$REF.tar" > out/entries.txt
+          sed -n "1,20p" out/entries.txt
+      - name: Compress and checksum
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          cd out
+          gzip -1 "happy-image-$REF.tar"
+          ls -lh
+          sha256sum "happy-image-$REF.tar.gz" | tee SHA256SUMS.txt
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          TAG="image-direct-$REF"
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" "out/happy-image-$REF.tar.gz" out/SHA256SUMS.txt \
+            --repo "${{ github.repository }}" \
+            --title "Happy arm64 image $REF (original layer blobs)" \
+            --notes-file out/SHA256SUMS.txt
