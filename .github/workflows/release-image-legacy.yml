@@ -36,7 +36,8 @@ jobs:
             "docker://$IMAGE:$REF" \
             "docker-archive:out/happy-image-$REF.tar:$IMAGE:$REF"
           ls -lh out/
-          tar -tf "out/happy-image-$REF.tar" | head -20
+          tar -tf "out/happy-image-$REF.tar" > out/layers.txt
+          sed -n "1,20p" out/layers.txt
       - name: Self-test archive on this runner
         env:
           REF: ${{ inputs.ref }}
