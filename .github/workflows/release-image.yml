@@ -1,0 +1,87 @@
+name: release-happy-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Image tag to package (default cli-1.2.5)'
+        required: true
+        default: cli-1.2.5
+
+permissions:
+  contents: write
+  packages: read
+
+env:
+  IMAGE: ghcr.io/mobius-w/happy-arm64
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull pinned image
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE:$REF"
+
+      - name: Save and compress
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # docker save writes uncompressed layers; gzip -1 brings it back to
+          # roughly the registry size without burning runner CPU.
+          docker save "$IMAGE:$REF" | gzip -1 > "out/happy-image-$REF.tar.gz"
+          cd out
+          ls -lh
+          sha256sum "happy-image-$REF.tar.gz" | tee SHA256SUMS.txt
+
+      - name: Split if over the 2 GB asset limit
+        run: |
+          set -euo pipefail
+          cd out
+          F="happy-image-${{ inputs.ref }}.tar.gz"
+          SIZE=$(stat -c%s "$F")
+          echo "size=$SIZE"
+          if [ "$SIZE" -gt 1900000000 ]; then
+            split -b 1900M -d "$F" "$F.part"
+            rm -f "$F"
+          fi
+          ls -lh
+
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          TAG="image-$REF"
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" out/* \
+            --repo "${{ github.repository }}" \
+            --title "Happy arm64 image $REF" \
+            --notes-file out/SHA256SUMS.txt
+
+      - name: Summary
+        run: |
+          {
+            echo "### image packaged"
+            echo ""
+            echo "- image: \`$IMAGE:${{ inputs.ref }}\`"
+            echo "- release tag: \`image-${{ inputs.ref }}\`"
+            echo "- assets: \`happy-image-${{ inputs.ref }}.tar.gz\` (split if >1.9 GB)"
+          } >> "$GITHUB_STEP_SUMMARY"
